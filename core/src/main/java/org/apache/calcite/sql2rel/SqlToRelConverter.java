@@ -25,6 +25,7 @@ import org.apache.calcite.plan.RelOptSamplingParameters;
 import org.apache.calcite.plan.RelOptTable;
 import org.apache.calcite.plan.RelOptUtil;
 import org.apache.calcite.plan.RelTraitSet;
+import org.apache.calcite.prepare.CalcitePrepareImpl;
 import org.apache.calcite.prepare.Prepare;
 import org.apache.calcite.prepare.RelOptTableImpl;
 import org.apache.calcite.rel.RelCollation;
@@ -234,7 +235,7 @@ public class SqlToRelConverter {
   /** Size of the smallest IN list that will be converted to a semijoin to a
    * static table. */
   /* OVERRIDE POINT */
-  public static final int DEFAULT_IN_SUB_QUERY_THRESHOLD = Integer.MAX_VALUE;
+  public static final int DEFAULT_IN_SUB_QUERY_THRESHOLD = 20;
 
   @Deprecated // to be removed before 2.0
   public static final int DEFAULT_IN_SUBQUERY_THRESHOLD =
@@ -1160,16 +1161,23 @@ public class SqlToRelConverter {
 
       if (query instanceof SqlNodeList) {
         SqlNodeList valueList = (SqlNodeList) query;
-        if (!containsNullLiteral(valueList)
-            && valueList.size() < config.getInSubQueryThreshold()) {
+        if (!containsNullLiteral(valueList)) {
+          subQuery.expr = null;
+          // keep in clause
+          if (config.isKeepInClause()) {
+            subQuery.expr = constructIn(bb, leftKeys, valueList, call.getOperator().kind);
+            return;
+          }
           // We're under the threshold, so convert to OR.
-          subQuery.expr =
-              convertInToOr(
-                  bb, leftKeyNode,
-                  leftKeys,
-                  valueList,
-                  (SqlInOperator) call.getOperator());
-          return;
+          if (subQuery.expr == null && valueList.size() < config.getInSubQueryThreshold()) {
+            subQuery.expr =
+                    convertInToOr(
+                            bb, leftKeyNode,
+                            leftKeys,
+                            valueList,
+                            (SqlInOperator) call.getOperator());
+            return;
+          }
         }
 
         // Otherwise, let convertExists translate
@@ -1303,6 +1311,24 @@ public class SqlToRelConverter {
     default:
       throw new AssertionError("unexpected kind of sub-query: "
           + subQuery.node);
+    }
+  }
+
+  private RexNode constructIn(Blackboard bb, List<RexNode> leftKeys, SqlNodeList valuesList,
+                              SqlKind kind) {
+    List<RexNode> listRexNodes = new ArrayList<>(leftKeys);
+    for (SqlNode node : valuesList) {
+      listRexNodes.add(bb.convertExpression(node));
+    }
+
+    switch (kind) {
+    case NOT_IN:
+      return rexBuilder.makeCall(SqlStdOperatorTable.NOT_IN, listRexNodes);
+    case IN:
+    case SOME:
+      return rexBuilder.makeCall(SqlStdOperatorTable.IN, listRexNodes);
+    default:
+      return null;
     }
   }
 
@@ -5639,6 +5665,10 @@ public class SqlToRelConverter {
      * {@link org.apache.calcite.rex.RexSubQuery}. */
     boolean isExpand();
 
+    /** Returns the {@code expand} option. Controls whether to keep
+     * in clause. If true, each in clause will remain unchanged. */
+    boolean isKeepInClause();
+
     /** Returns the {@code inSubQueryThreshold} option,
      * default {@link #DEFAULT_IN_SUB_QUERY_THRESHOLD}. Controls the list size
      * threshold under which {@link #convertInToOr} is used. Lists of this size
@@ -5662,6 +5692,8 @@ public class SqlToRelConverter {
     private boolean createValuesRel = true;
     private boolean explain;
     private boolean expand = true;
+    private boolean keepInClause = CalcitePrepareImpl.KEEP_IN_CLAUSE.get() != null
+            && CalcitePrepareImpl.KEEP_IN_CLAUSE.get();
     private int inSubQueryThreshold = DEFAULT_IN_SUB_QUERY_THRESHOLD;
     private RelBuilderFactory relBuilderFactory = RelFactories.LOGICAL_BUILDER;
 
@@ -5675,6 +5707,7 @@ public class SqlToRelConverter {
       this.createValuesRel = config.isCreateValuesRel();
       this.explain = config.isExplain();
       this.expand = config.isExpand();
+      this.keepInClause = config.isKeepInClause();
       this.inSubQueryThreshold = config.getInSubQueryThreshold();
       this.relBuilderFactory = config.getRelBuilderFactory();
       return this;
@@ -5710,6 +5743,11 @@ public class SqlToRelConverter {
       return this;
     }
 
+    public ConfigBuilder withKeepInClause(boolean keepInClause) {
+      this.keepInClause = keepInClause;
+      return this;
+    }
+
     @Deprecated // to be removed before 2.0
     public ConfigBuilder withInSubqueryThreshold(int inSubQueryThreshold) {
       return withInSubQueryThreshold(inSubQueryThreshold);
@@ -5729,7 +5767,7 @@ public class SqlToRelConverter {
     /** Builds a {@link Config}. */
     public Config build() {
       return new ConfigImpl(convertTableAccess, decorrelationEnabled,
-          trimUnusedFields, createValuesRel, explain, expand,
+          trimUnusedFields, createValuesRel, explain, expand, keepInClause,
           inSubQueryThreshold, relBuilderFactory);
     }
   }
@@ -5743,12 +5781,13 @@ public class SqlToRelConverter {
     private final boolean createValuesRel;
     private final boolean explain;
     private final boolean expand;
+    private final boolean keepInClause;
     private final int inSubQueryThreshold;
     private final RelBuilderFactory relBuilderFactory;
 
     private ConfigImpl(boolean convertTableAccess, boolean decorrelationEnabled,
         boolean trimUnusedFields, boolean createValuesRel, boolean explain,
-        boolean expand, int inSubQueryThreshold,
+        boolean expand, boolean keepInClause, int inSubQueryThreshold,
         RelBuilderFactory relBuilderFactory) {
       this.convertTableAccess = convertTableAccess;
       this.decorrelationEnabled = decorrelationEnabled;
@@ -5756,6 +5795,7 @@ public class SqlToRelConverter {
       this.createValuesRel = createValuesRel;
       this.explain = explain;
       this.expand = expand;
+      this.keepInClause = keepInClause;
       this.inSubQueryThreshold = inSubQueryThreshold;
       this.relBuilderFactory = relBuilderFactory;
     }
@@ -5767,7 +5807,6 @@ public class SqlToRelConverter {
     public boolean isDecorrelationEnabled() {
       return decorrelationEnabled;
     }
-
     public boolean isTrimUnusedFields() {
       return trimUnusedFields;
     }
@@ -5782,6 +5821,10 @@ public class SqlToRelConverter {
 
     public boolean isExpand() {
       return expand;
+    }
+
+    public boolean isKeepInClause() {
+      return keepInClause;
     }
 
     public int getInSubQueryThreshold() {
